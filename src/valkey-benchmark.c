@@ -142,6 +142,8 @@ static struct config {
     int enable_tracking;
     int num_functions;
     int num_keys_in_fcall;
+    int rw_read;          /* number of GETs per cycle  */
+    int rw_write;         /* number of SETs per cycle  */
     pthread_mutex_t liveclients_mutex;
     pthread_mutex_t is_updating_slots_mutex;
     int resp3; /* use RESP3 */
@@ -225,6 +227,7 @@ static void freeServerConfig(serverConfig *cfg);
 static int fetchClusterSlotsConfiguration(client c);
 static void updateClusterSlotsConfiguration(void);
 static long long showThroughput(struct aeEventLoop *eventLoop, long long id, void *clientData);
+static sds buildMixedSequence(const char *tag, const char *payload, int reads, int writes, int *seqlen);
 
 /* Dict callbacks */
 static uint64_t dictSdsHash(const void *key);
@@ -1694,6 +1697,14 @@ int parseOptions(int argc, char **argv) {
             config.num_functions = atoi(argv[++i]);
         } else if (!strcmp(argv[i], "--num-keys-in-fcall")) {
             config.num_keys_in_fcall = atoi(argv[++i]);
+        } else if (!strcmp(argv[i], "--rw-ratio")) {
+            if (lastarg) goto invalid;
+            int r = 0, w = 0;
+            if (sscanf(argv[++i], "%d:%d", &r, &w) != 2 ||
+                r < 0 || w < 0 || (r == 0 && w == 0))
+                goto invalid;
+            config.rw_read  = r;
+            config.rw_write = w;
         } else if (!strcmp(argv[i], "--help")) {
             exit_status = 0;
             goto usage;
@@ -1875,9 +1886,13 @@ usage:
         " --num-functions <num>\n"
         "                    Sets the number of functions present in the Lua lib that is\n"
         "                    loaded when running the 'function_load' test. (default 10).\n"
-        " --num-keys-in-fcall <num>\n"
+       " --num-keys-in-fcall <num>\n"
         "                    Sets the number of keys passed to FCALL command when running\n"
-        "                    the 'fcall' test. (default 1)\n",
+        "                    the 'fcall' test (default 1)\n"
+        " --rw-ratio R:W     Generate a mixed workload consisting of R\n"
+        "                    GET and W SET commands per cycle, e.g. 80:20. When this\n"
+        "                    option is used (and no explicit command sequence is\n"
+        "                    provided) the default benchmark suite is skipped.\n",
         tls_usage,
         rdma_usage,
         " --mptcp            Enable an MPTCP connection.\n"
@@ -1943,6 +1958,29 @@ long long showThroughput(struct aeEventLoop *eventLoop, long long id, void *clie
     hdr_reset(config.current_sec_latency_histogram);
     fflush(stdout);
     return SHOW_THROUGHPUT_INTERVAL;
+}
+
+/* helper that builds “GET…SET…” sequence for deterministic R/W cycle */
+static sds buildMixedSequence(const char *tag,
+                              const char *payload,
+                              int reads, int writes,
+                              int *seqlen) {
+    sds seq = sdsempty();
+    char *cmd = NULL;
+    int len, i;
+
+    for (i = 0; i < reads; i++) {
+        len = valkeyFormatCommand(&cmd, "GET key%s:__rand_int__", tag);
+        seq = sdscatlen(seq, cmd, len);
+        free(cmd);
+    }
+    for (i = 0; i < writes; i++) {
+        len = valkeyFormatCommand(&cmd, "SET key%s:__rand_int__ %s", tag, payload);
+        seq = sdscatlen(seq, cmd, len);
+        free(cmd);
+    }
+    if (seqlen) *seqlen = reads + writes;
+    return seq;
 }
 
 char *generateFunctionScript(uint32_t num_functions, int with_keys) {
@@ -2048,6 +2086,8 @@ int main(int argc, char **argv) {
     config.enable_tracking = 0;
     config.num_functions = 10;
     config.num_keys_in_fcall = 1;
+    config.rw_read  = 0; 
+    config.rw_write = 0;
     config.resp3 = 0;
     resetPlaceholders();
 
@@ -2242,7 +2282,27 @@ int main(int argc, char **argv) {
         return 0;
     }
 
-    /* Run default benchmark suite. */
+    /* Run mixed workload */
+    if (!argc && (config.rw_read || config.rw_write)) {
+      
+        char *payload = zmalloc(config.datasize + 1);
+        genBenchmarkRandomData(payload, config.datasize);
+        payload[config.datasize] = '\0';
+
+        int seqlen = 0;
+        sds seq = buildMixedSequence(tag, payload,
+                                     config.rw_read, config.rw_write,
+                                     &seqlen);
+        benchmarkSequence("MIXED_RW", seq, sdslen(seq), seqlen);
+
+        sdsfree(seq);
+        zfree(payload);
+        freeCliConnInfo(config.conn_info);
+        if (config.server_config != NULL) freeServerConfig(config.server_config);
+        return 0;
+    }
+
+    /* Run default benchmark suite*/
     data = zmalloc(config.datasize + 1);
     do {
         genBenchmarkRandomData(data, config.datasize);
