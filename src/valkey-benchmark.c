@@ -142,6 +142,9 @@ static struct config {
     int enable_tracking;
     int num_functions;
     int num_keys_in_fcall;
+    unsigned int rw_reads;
+    unsigned int rw_writes;
+    int use_rw_ratio;
     pthread_mutex_t liveclients_mutex;
     pthread_mutex_t is_updating_slots_mutex;
     int resp3; /* use RESP3 */
@@ -225,6 +228,8 @@ static void freeServerConfig(serverConfig *cfg);
 static int fetchClusterSlotsConfiguration(client c);
 static void updateClusterSlotsConfiguration(void);
 static long long showThroughput(struct aeEventLoop *eventLoop, long long id, void *clientData);
+static void initBenchmarkHistograms(void);
+static void closeBenchmarkHistograms(void);
 
 /* Dict callbacks */
 static uint64_t dictSdsHash(const void *key);
@@ -1171,6 +1176,27 @@ static void showLatencyReport(void) {
     }
 }
 
+/* Common helpers used by both benchmarkSequence and benchmarkRWRatio to
+ * setup and later free the latency histograms. Using small helpers avoids
+ * repeating the same hdr_init and hdr_close logic in multiple places. */
+static void initBenchmarkHistograms(void) {
+    hdr_init(CONFIG_LATENCY_HISTOGRAM_MIN_VALUE,
+             CONFIG_LATENCY_HISTOGRAM_MAX_VALUE,
+             config.precision,
+             &config.latency_histogram);
+    hdr_init(CONFIG_LATENCY_HISTOGRAM_MIN_VALUE,
+             CONFIG_LATENCY_HISTOGRAM_INSTANT_MAX_VALUE,
+             config.precision,
+             &config.current_sec_latency_histogram);
+}
+
+static void closeBenchmarkHistograms(void) {
+    if (config.current_sec_latency_histogram)
+        hdr_close(config.current_sec_latency_histogram);
+    if (config.latency_histogram)
+        hdr_close(config.latency_histogram);
+}
+
 static void initBenchmarkThreads(void) {
     int i;
     if (config.threads) freeBenchmarkThreads();
@@ -1203,14 +1229,7 @@ static void benchmarkSequence(const char *title, char *cmd, int len, int seqlen)
     config.requests_finished = 0;
     config.previous_requests_finished = 0;
     config.last_printed_bytes = 0;
-    hdr_init(CONFIG_LATENCY_HISTOGRAM_MIN_VALUE,         // Minimum value
-             CONFIG_LATENCY_HISTOGRAM_MAX_VALUE,         // Maximum value
-             config.precision,                           // Number of significant figures
-             &config.latency_histogram);                 // Pointer to initialise
-    hdr_init(CONFIG_LATENCY_HISTOGRAM_MIN_VALUE,         // Minimum value
-             CONFIG_LATENCY_HISTOGRAM_INSTANT_MAX_VALUE, // Maximum value
-             config.precision,                           // Number of significant figures
-             &config.current_sec_latency_histogram);     // Pointer to initialise
+    initBenchmarkHistograms();
 
     initPlaceholders(cmd, len);
     if (config.num_threads) initBenchmarkThreads();
@@ -1235,13 +1254,56 @@ static void benchmarkSequence(const char *title, char *cmd, int len, int seqlen)
     showLatencyReport();
     freeAllClients();
     if (config.threads) freeBenchmarkThreads();
-    if (config.current_sec_latency_histogram) hdr_close(config.current_sec_latency_histogram);
-    if (config.latency_histogram) hdr_close(config.latency_histogram);
+    closeBenchmarkHistograms();
 }
 
 /* Benchmark a single RESP-encoded command of length len. */
 static void benchmark(const char *title, char *cmd, int len) {
     benchmarkSequence(title, cmd, len, 1);
+}
+
+static void createClientsForCommand(char *cmd, int len, int count) {
+    if (count <= 0) return;
+    int thread_id = config.num_threads ? config.liveclients % config.num_threads : -1;
+    client base = createClient(cmd, len, 1, NULL, thread_id);
+    if (!base) return;
+    for (int i = 1; i < count; i++) {
+        thread_id = config.num_threads ? config.liveclients % config.num_threads : -1;
+        createClient(NULL, 0, 0, base, thread_id);
+    }
+}
+
+static void benchmarkRWRatio(const char *title, char *get_cmd, int get_len, char *set_cmd, int set_len) {
+    config.title = title;
+    config.requests_issued = 0;
+    config.requests_finished = 0;
+    config.previous_requests_finished = 0;
+    config.last_printed_bytes = 0;
+    initBenchmarkHistograms();
+
+    if (config.num_threads) initBenchmarkThreads();
+
+    int total = config.rw_reads + config.rw_writes;
+    if (total == 0) return; /* Should not happen due to validation */
+    int get_clients = (config.numclients * config.rw_reads) / total;
+    int set_clients = config.numclients - get_clients;
+    if (get_clients == 0 && config.rw_reads) get_clients = 1;
+    if (set_clients == 0 && config.rw_writes) set_clients = 1;
+
+    createClientsForCommand(get_cmd, get_len, get_clients);
+    createClientsForCommand(set_cmd, set_len, set_clients);
+
+    config.start = mstime();
+    if (!config.num_threads)
+        aeMain(config.el);
+    else
+        startBenchmarkThreads();
+    config.totlatency = mstime() - config.start;
+
+    showLatencyReport();
+    freeAllClients();
+    if (config.threads) freeBenchmarkThreads();
+    closeBenchmarkHistograms();
 }
 
 /* Thread functions. */
@@ -1694,6 +1756,16 @@ int parseOptions(int argc, char **argv) {
             config.num_functions = atoi(argv[++i]);
         } else if (!strcmp(argv[i], "--num-keys-in-fcall")) {
             config.num_keys_in_fcall = atoi(argv[++i]);
+        } else if (!strcmp(argv[i], "--ratio")) {
+            int reads, writes;
+            if (lastarg) goto invalid;
+            if (sscanf(argv[++i], "%d:%d", &reads, &writes) != 2)
+                goto invalid;
+            if (reads < 0 || writes < 0 || (reads == 0 && writes == 0))
+                goto invalid;
+            config.rw_reads = reads;
+            config.rw_writes = writes;
+            config.use_rw_ratio = 1;
         } else if (!strcmp(argv[i], "--help")) {
             exit_status = 0;
             goto usage;
@@ -1878,6 +1950,7 @@ usage:
         " --num-keys-in-fcall <num>\n"
         "                    Sets the number of keys passed to FCALL command when running\n"
         "                    the 'fcall' test. (default 1)\n",
+        " --ratio <R:W>      Run GET/SET mixed workload with R:W read/write ratio (e.g., --ratio 80:20).\n",
         tls_usage,
         rdma_usage,
         " --mptcp            Enable an MPTCP connection.\n"
@@ -2048,6 +2121,9 @@ int main(int argc, char **argv) {
     config.enable_tracking = 0;
     config.num_functions = 10;
     config.num_keys_in_fcall = 1;
+    config.rw_reads = 0;
+    config.rw_writes = 0;
+    config.use_rw_ratio = 0;
     config.resp3 = 0;
     resetPlaceholders();
 
@@ -2248,6 +2324,17 @@ int main(int argc, char **argv) {
         genBenchmarkRandomData(data, config.datasize);
         data[config.datasize] = '\0';
 
+        if (config.use_rw_ratio) {
+            char ratio_title[64];
+            snprintf(ratio_title, sizeof(ratio_title), "GET/SET %u:%u ratio",
+                     config.rw_reads, config.rw_writes);
+            char *get_cmd, *set_cmd;
+            int get_len = valkeyFormatCommand(&get_cmd, "GET key%s:__rand_int__", tag);
+            int set_len = valkeyFormatCommand(&set_cmd, "SET key%s:__rand_int__ %s", tag, data);
+            benchmarkRWRatio(ratio_title, get_cmd, get_len, set_cmd, set_len);
+            free(get_cmd);
+            free(set_cmd);
+        } else {
         if (test_is_selected("ping_inline") || test_is_selected("ping")) benchmark("PING_INLINE", "PING\r\n", 6);
 
         if (test_is_selected("ping_mbulk") || test_is_selected("ping")) {
@@ -2438,8 +2525,8 @@ int main(int argc, char **argv) {
             benchmark("FCALL", cmd, len);
             free(cmd);
         }
-
         if (!config.csv) printf("\n");
+    }
     } while (config.loop);
 
     zfree(data);
